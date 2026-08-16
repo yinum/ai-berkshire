@@ -37,12 +37,15 @@ decision_log.py — 决策日志 + alpha 回填 + 反思注入
 """
 
 import argparse
+import fcntl
 import json
+import math
 import os
 import re
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 # ============================================================
@@ -83,8 +86,12 @@ RATING_ALIASES = {
 }
 NON_CALLS = {"通过", "pass", "进入深度研究", "观察名单"}
 
-# 基准：美股对 SPY，港股对 ^HSI，日股对 ^N225，A 股对 000300.SS
-BENCHMARKS = {"us": "SPY", "hk": "^HSI", "jp": "^N225", "cn": "000300.SS"}
+# 基准一律用**可复权的 ETF**，不用价格指数。
+# ^HSI / ^N225 / 000300.SS 都没有 adjclose，会回落到收盘价 = 价格收益；
+# 而标的那边是全收益。两者相减，alpha 会被指数股息率系统性抬高
+# （恒指约 3–4%/年 → 180 天 1–2 个点），且方向恒定对多头有利。
+BENCHMARKS = {"us": "SPY", "hk": "2800.HK", "jp": "1321.T",
+              "cn": "510300.SS", "tw": "0050.TW"}
 
 TIERS = ["T1", "T2", "T3"]
 STATUSES = ["pending", "resolved", "void"]
@@ -93,7 +100,7 @@ STATUSES = ["pending", "resolved", "void"]
 META_KEYS = [
     "id", "ticker", "market", "tier", "rating", "decided_on",
     "horizon_class", "horizon_days",
-    "benchmark", "entry_price", "bench_entry", "status", "source", "retro",
+    "benchmark", "entry_date", "entry_price", "bench_entry", "status", "source", "retro",
     "resolved_on", "exit_price", "bench_exit", "raw_return", "bench_return",
     "alpha", "call_alpha", "held_days",
 ]
@@ -132,7 +139,10 @@ HEADER = """# 决策日志（只追加）
 > **规矩**：理由字段（`thesis` / `kill`）写下就不许改。只有「结果」和「反思」可以回填。
 > 事后改理由就是事后合理化，那正是这个日志要防的东西。
 >
-> 用 `tools/decision_log.py` 读写，不要手改（手改也不会坏，但重复检测和原子写就没了）。
+> **用 `tools/decision_log.py` 读写，不要手改。** 手改**会**坏：少一个条目结尾的分隔注释，
+> 就足以让一条记录消失、另一条顶着别人的理由。工具现在会在解析时发现这类问题并直接拒绝运行
+> （宁可整条命令失败，也不在坏结构上继续读写），但它只能报警，不能替你还原丢掉的内容。
+> ——顺带一提，这段话本身不能写出那个分隔符的字面形式，否则它就会被当成一个真的分隔符。
 
 ---
 """
@@ -198,20 +208,108 @@ def latest_price(rows):
     return rows[-1] if rows else None
 
 
+def aligned_series(ticker, benchmark, start_date):
+    """标的与基准的**同一次拉取、按共同交易日对齐**的价格序列。
+
+    这个函数存在的理由是交叉评审里最严重的一条 bug：原来入场价是几个月前存下的
+    adjclose，退出价是今天重新拉的 adjclose。Yahoo 的复权价是**回溯调整**的——
+    每次分红或拆股，全部历史值都会被重算。两个快照的基准不同，相除得到的东西是错的：
+      * 2:1 拆股 → 显示成 −50%，一条正确的多头判断被记成惨败；
+      * 分红被静默丢掉 → 算出来其实是价格收益，而文件头明写着"含分红"。
+    两端都从同一次响应里取，问题就不存在了。
+
+    顺带修掉另外两条：两边各取各的最后一根 bar（停牌/退市时窗口不同），
+    以及只按标的的交易日算天数。
+
+    返回 (dates, smap, bmap)，dates 是两边都有报价的日期，升序。
+    """
+    smap = dict(fetch_adjclose(ticker, start_date))
+    bmap = dict(fetch_adjclose(benchmark, start_date))
+    return sorted(set(smap) & set(bmap)), smap, bmap
+
+
+def pick_date(dates, on_or_after=None):
+    """第一个 >= on_or_after 的共同交易日；不给就取最后一个。"""
+    if not dates:
+        return None
+    if on_or_after is None:
+        return dates[-1]
+    for d in dates:
+        if d >= on_or_after:
+            return d
+    return None
+
+
+def measure(e, dates, smap, bmap, exit_date):
+    """按 (入场日, 退出日) 两个共同交易日算收益。两端同源，基准一致。"""
+    entry_date = pick_date(dates, e["decided_on"])
+    if not entry_date or not exit_date:
+        return None
+    raw = (smap[exit_date] / smap[entry_date] - 1) * 100
+    bench = (bmap[exit_date] / bmap[entry_date] - 1) * 100
+    alpha = raw - bench
+    d = DIRECTION.get(e["rating"], 0)
+    return {
+        "entry_date": entry_date, "exit_date": exit_date,
+        "entry_px": smap[entry_date], "exit_px": smap[exit_date],
+        "bench_entry": bmap[entry_date], "bench_exit": bmap[exit_date],
+        "raw": raw, "bench": bench, "alpha": alpha,
+        "call_alpha": alpha * d if d else None,
+        "held": days_between(entry_date, exit_date),
+    }
+
+
 # ============================================================
 # 解析 / 序列化
 # ============================================================
 
+class LogCorrupt(Exception):
+    """日志结构被破坏。宁可整个命令失败，也不要在坏结构上继续读写——
+    交叉评审里最严重的一条就是：少一个 ENTRY_END，一条记录会被静默吞掉，
+    幸存的那条还会顶着别人的 thesis/kill。那正是这个日志要防的事后合理化。"""
+
+
+REQUIRED_KEYS = ("id", "ticker", "rating", "decided_on", "status")
+
+
 def parse_entries(text):
-    """把日志切成条目列表。硬分隔符是 ENTRY_END——LLM 散文里不可能出现这个串。"""
-    entries = []
-    for chunk in text.split(ENTRY_END):
+    """把日志切成条目列表。任何结构异常一律抛 LogCorrupt，不做"尽力而为"的解析。
+
+    元数据**只从正文区之前**读（第一个 `### ` 之前）。否则 thesis / kill / 反思里
+    出现一行 `- ``status``: resolved` 就会覆盖真元数据——模型写反思时写出这种行完全合理。
+    """
+    n_start, n_end = text.count(ENTRY_START), text.count(ENTRY_END)
+    if n_start != n_end:
+        raise LogCorrupt(
+            f"分隔符不配对：{n_start} 个 ENTRY_START vs {n_end} 个 ENTRY_END。"
+            f"多半是手改或粘贴时丢了一个 `{ENTRY_END}`。修好之前不动这个文件。")
+
+    entries, seen_ids = [], {}
+    for i, chunk in enumerate(text.split(ENTRY_END)):
         if ENTRY_START not in chunk:
             continue
+        if chunk.count(ENTRY_START) > 1:
+            raise LogCorrupt(f"第 {i + 1} 段里有 {chunk.count(ENTRY_START)} 个 ENTRY_START，"
+                             f"说明两条记录粘在了一起。")
         body = chunk[chunk.index(ENTRY_START) + len(ENTRY_START):]
-        meta = {k: v for k, v in META_LINE.findall(body)}
-        if not meta.get("id"):
-            continue
+
+        # 元数据区 = 正文区（第一个 `### `）之前
+        meta_region = body.split("\n### ", 1)[0]
+        pairs = META_LINE.findall(meta_region)
+        keys = [k for k, _ in pairs]
+        dups = sorted({k for k in keys if keys.count(k) > 1})
+        if dups:
+            raise LogCorrupt(f"元数据键重复：{dups}（第 {i + 1} 段）。")
+        meta = dict(pairs)
+
+        missing = [k for k in REQUIRED_KEYS if not meta.get(k) or meta[k] == "—"]
+        if missing:
+            raise LogCorrupt(f"第 {i + 1} 段缺必填字段 {missing}"
+                             + (f"（id={meta['id']}）" if meta.get("id") else "（连 id 都没有）"))
+        if meta["id"] in seen_ids:
+            raise LogCorrupt(f"id 重复：{meta['id']}。resolve/reflect 会同时改到两条。")
+        seen_ids[meta["id"]] = True
+
         meta["_raw"] = ENTRY_START + body + ENTRY_END
         meta["_thesis"] = section_text(body, "论文一句话")
         meta["_kill"] = section_text(body, "什么会证伪它")
@@ -223,7 +321,28 @@ def parse_entries(text):
 def section_text(body, title):
     m = re.search(rf"^### {re.escape(title)}\s*\n(.*?)(?=\n### |\n<!-- |\Z)", body,
                   re.MULTILINE | re.DOTALL)
-    return m.group(1).strip() if m else ""
+    s = m.group(1).strip() if m else ""
+    return "" if s == "—" else s   # 渲染占位符读回来算空，不算内容
+
+
+META_LINE_ONE = re.compile(r"^\s*- `[a-z_]+`:")
+
+
+def check_prose(field, s):
+    """理由字段写进去之前先验一遍。渲染→解析必须能原样往返，否则下一次
+    resolve/reflect 重渲染时这段文字会被截断或串位——而理由字段是不许改的。"""
+    if not s:
+        return
+    for tok in (ENTRY_START, ENTRY_END):
+        if tok in s:
+            sys.exit(f"--{field} 里不能出现 `{tok}`——那是日志的硬分隔符，会把条目劈开。")
+    for ln in s.splitlines():
+        if ln.startswith("### "):
+            sys.exit(f"--{field} 里不能有以 `### ` 开头的行——它会被当成新的小节，后面的内容会丢。")
+        if ln.lstrip().startswith("<!--"):
+            sys.exit(f"--{field} 里不能有 HTML 注释——小节解析会在这里截断。")
+        if META_LINE_ONE.match(ln):
+            sys.exit(f"--{field} 里不能有 `- `键`: 值` 形式的行——会被当成元数据。")
 
 
 def hclass(meta):
@@ -236,7 +355,8 @@ def render_entry(meta, thesis, kill, reflection):
     lines = [ENTRY_START, ""]
     tag = (f"{meta['decided_on']} | {meta['ticker']} | "
            f"{HORIZON_LABEL[hclass(meta)]} | {meta['rating']} | ")
-    tag += "pending" if meta["status"] == "pending" else fmt_result_tag(meta)
+    tag += ({"pending": "pending", "void": "void（已作废，不计分）"}.get(meta["status"])
+            or fmt_result_tag(meta))
     lines.append(f"## [{tag}]")
     lines.append("")
     for k in META_KEYS:
@@ -285,6 +405,46 @@ def read_log(path):
         return ""
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
+
+
+@contextmanager
+def log_lock(path):
+    """整个 读→校验→改→写 事务上锁。
+
+    原子写只保证不留半个文件，不保证不丢更新：两个进程同时 read 到旧内容，
+    后写的那个会静默覆盖先写的。单用户也会撞上——两个终端各跑一条 add 就够了。
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path + ".lock", "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def safe_write(path, new_text, before, expect_delta=0):
+    """写盘前把新文本重新解析一遍，验完不变量才落盘。
+
+    验两件事：条目数对得上（没被吞、没被重复替换）；已存在条目的 thesis / kill
+    一个字都没变。理由字段只许写一次——这是整个日志的立身之本，
+    所以它不能只是"规矩"，得是写盘前会失败的检查。
+    """
+    after = parse_entries(new_text)          # 结构坏了这里就抛
+    if len(after) != len(before) + expect_delta:
+        raise LogCorrupt(f"条目数异常：写前 {len(before)} 条，预期 {len(before) + expect_delta} 条，"
+                         f"实际渲染出 {len(after)} 条。已中止，日志未被修改。")
+    old_by = {e["id"]: e for e in before}
+    for e in after:
+        o = old_by.get(e["id"])
+        if not o:
+            continue
+        for fld, label in (("_thesis", "论文一句话"), ("_kill", "什么会证伪它")):
+            if e[fld] != o[fld]:
+                raise LogCorrupt(
+                    f"{e['id']} 的「{label}」被改动了。理由字段只许写一次——"
+                    f"事后改理由就是事后合理化。已中止，日志未被修改。")
+    atomic_write(path, new_text)
 
 
 def atomic_write(path, text):
@@ -339,8 +499,13 @@ def guess_tier(market):
 
 
 def next_id(entries, ticker, date_str, hc="long"):
+    """按已存在的 id 逐个试，不用计数——手删过一条的话计数式会撞号，
+    撞号之后 resolve --id 会同时改到两条。"""
     stem = f"{date_str.replace('-', '')}-{ticker.upper()}-{hc[0].upper()}"
-    n = sum(1 for e in entries if e["id"].startswith(stem)) + 1
+    used = {e["id"] for e in entries}
+    n = 1
+    while f"{stem}{n:02d}" in used:
+        n += 1
     return f"{stem}{n:02d}"
 
 
@@ -349,11 +514,16 @@ def days_between(a, b):
 
 
 def num(v, default=None):
-    """空字段在日志里渲染成 '—'，读回来要能安全转数字。"""
+    """空字段在日志里渲染成 '—'，读回来要能安全转数字。
+
+    NaN / inf 一律当无效：手改坏的条目应该被排除或报错，
+    不能悄悄变成一个看起来合理的数字去污染汇总。
+    """
     try:
-        return float(v)
+        f = float(v)
     except (TypeError, ValueError):
         return default
+    return f if math.isfinite(f) else default
 
 
 def today():
@@ -366,6 +536,13 @@ def today():
 
 def cmd_add(args):
     path = args.log
+    check_prose("thesis", args.thesis)
+    check_prose("kill", args.kill)
+    with log_lock(path):
+        _add_locked(args, path)
+
+
+def _add_locked(args, path):
     text = ensure_header(read_log(path))
     entries = parse_entries(text)
 
@@ -394,16 +571,17 @@ def cmd_add(args):
         sys.exit(f"tier 只能是 {TIERS}")
     benchmark = args.benchmark or BENCHMARKS.get(market, "SPY")
 
-    rows = fetch_adjclose(ticker, decided_on, decided_on)
-    hit = price_on_or_after(rows, decided_on)
-    brows = fetch_adjclose(benchmark, decided_on, decided_on)
-    bhit = price_on_or_after(brows, decided_on)
-
-    if not hit:
-        print(f"⚠️  取不到 {ticker} 在 {decided_on} 的复权价——条目照记，但 alpha 回填不了。"
-              f"（T3 标的和部分海外票 Yahoo 覆盖不全）", file=sys.stderr)
-    if not bhit:
-        print(f"⚠️  取不到基准 {benchmark} 的价格。", file=sys.stderr)
+    # 取入场价：按**共同交易日**取，窗口给到决策日 +14 天。
+    # 原来窗口只到 +2 天，周六决策碰上长周末就取不到任何 bar，
+    # 条目照记但 entry_price 为空 → 永远无法判定。
+    dates, smap, bmap = aligned_series(ticker, benchmark, decided_on)
+    entry_date = pick_date(dates, decided_on)
+    if not entry_date:
+        print(f"⚠️  {decided_on} 之后取不到 {ticker} 与 {benchmark} 的共同交易日——"
+              f"条目照记，但 alpha 回填不了。（T3 标的和部分海外票 Yahoo 覆盖不全）",
+              file=sys.stderr)
+    elif entry_date != decided_on:
+        print(f"ℹ️  {decided_on} 不是交易日，入场价按 {entry_date} 计。", file=sys.stderr)
 
     horizon = args.horizon if args.horizon else HORIZON_CLASSES[hc]
     meta = {
@@ -416,93 +594,140 @@ def cmd_add(args):
         "horizon_class": hc,
         "horizon_days": str(horizon),
         "benchmark": benchmark,
-        "entry_price": f"{hit[1]:.4f}" if hit else "",
-        "bench_entry": f"{bhit[1]:.4f}" if bhit else "",
+        "entry_date": entry_date or "",
+        "entry_price": f"{smap[entry_date]:.4f}" if entry_date else "",
+        "bench_entry": f"{bmap[entry_date]:.4f}" if entry_date else "",
         "status": "pending",
         "source": args.source or "—",
         "retro": "true" if args.retro else "false",
     }
     entry = render_entry(meta, args.thesis, args.kill, "")
-    atomic_write(path, text.rstrip() + "\n\n" + entry + "\n")
+    safe_write(path, text.rstrip() + "\n\n" + entry + "\n", entries, expect_delta=1)
 
     print(f"✅ {meta['id']}  {ticker} {HORIZON_LABEL[hc]} {rating} [{tier}]  基准 {benchmark}")
-    if hit:
-        print(f"   建仓参考 {hit[0]} @ {hit[1]:.2f}"
-              + (f"，基准 @ {bhit[1]:.2f}" if bhit else ""))
+    if entry_date:
+        print(f"   建仓参考 {entry_date} @ {smap[entry_date]:.2f}，基准 @ {bmap[entry_date]:.2f}")
     print(f"   判定日 ≥ {(datetime.strptime(decided_on, '%Y-%m-%d') + timedelta(days=horizon)).strftime('%Y-%m-%d')}"
           f"（{horizon} 天）")
     if args.retro:
         print("   ⚠️  标了 retro=true：回溯录入，不是当时真做的决策。统计时要和实时决策分开看。")
 
 
+def maturity_date(e):
+    """约定的判定日 = 决策日 + horizon_days。"""
+    return (datetime.strptime(e["decided_on"], "%Y-%m-%d")
+            + timedelta(days=int(num(e.get("horizon_days"), 0)))).strftime("%Y-%m-%d")
+
+
 def cmd_resolve(args):
     path = args.log
-    text = ensure_header(read_log(path))
-    entries = parse_entries(text)
-    targets = [e for e in entries if e["id"] == args.id] if args.id else \
-              [e for e in entries if e["status"] == "pending"
-               and days_between(e["decided_on"], today()) >= int(num(e.get("horizon_days"), 0))]
-    if not targets:
-        print("没有需要回填的条目。" if not args.id else f"找不到 id={args.id}")
-        return
+    with log_lock(path):
+        text = ensure_header(read_log(path))
+        entries = parse_entries(text)
+        targets = [e for e in entries if e["id"] == args.id] if args.id else \
+                  [e for e in entries if e["status"] == "pending"
+                   and today() >= maturity_date(e)]
+        if not targets:
+            print("没有需要回填的条目。" if not args.id else f"找不到 id={args.id}")
+            return
 
-    new_text = text
-    for e in targets:
-        if e["status"] != "pending":
-            print(f"跳过 {e['id']}：状态已是 {e['status']}")
-            continue
-        entry_px, bench_entry = num(e.get("entry_price")), num(e.get("bench_entry"))
-        if entry_px is None or bench_entry is None:
-            print(f"跳过 {e['id']}：当初就没取到建仓价或基准价，算不了 alpha。")
-            continue
+        new_text, n = text, 0
+        for e in targets:
+            if e["status"] != "pending":
+                print(f"跳过 {e['id']}：状态已是 {e['status']}")
+                continue
 
-        rows = fetch_adjclose(e["ticker"], e["decided_on"])
-        brows = fetch_adjclose(e["benchmark"], e["decided_on"])
-        last, blast = latest_price(rows), latest_price(brows)
-        if not last or not blast:
-            print(f"跳过 {e['id']}：取不到最新价。")
-            continue
+            due = maturity_date(e)
+            if today() < due and not args.early:
+                print(f"跳过 {e['id']}：判定日是 {due}，还没到。"
+                      f"提前判定会让分数取决于你哪天跑 resolve——真要提前用 --early。")
+                continue
 
-        raw = (last[1] / entry_px - 1) * 100
-        bench = (blast[1] / bench_entry - 1) * 100
-        alpha = raw - bench
-        held = days_between(e["decided_on"], last[0])
-        direction = DIRECTION.get(e["rating"], 0)
-        call_alpha = alpha * direction
+            dates, smap, bmap = aligned_series(e["ticker"], e["benchmark"], e["decided_on"])
+            if not dates:
+                print(f"跳过 {e['id']}：{e['ticker']} 与基准 {e['benchmark']} 没有共同交易日。")
+                continue
 
-        meta = {k: e.get(k, "") for k in META_KEYS}
-        meta.update({
-            "status": "resolved", "resolved_on": last[0],
-            "exit_price": f"{last[1]:.4f}", "bench_exit": f"{blast[1]:.4f}",
-            "raw_return": f"{raw:.2f}", "bench_return": f"{bench:.2f}",
-            "alpha": f"{alpha:.2f}",
-            "call_alpha": f"{call_alpha:.2f}" if direction else "n/a",
-            "held_days": str(held),
-        })
-        rebuilt = render_entry(meta, e["_thesis"], e["_kill"], e["_reflection"])
-        new_text = new_text.replace(e["_raw"], rebuilt)
+            # 判定价取**约定到期日当天或之后的第一个共同交易日**，不是"今天最新价"。
+            # 用最新价的话，晚一个月跑 resolve 就得到不同的分数——那不叫判定，叫挑日子。
+            exit_date = pick_date(dates, due) if not args.early else pick_date(dates)
+            if not exit_date:
+                print(f"跳过 {e['id']}：到期日 {due} 之后还没有共同交易日"
+                      f"（最后一个是 {dates[-1]}）。停牌或退市了？可以 `void --id {e['id']}`。")
+                continue
 
-        if direction == 0:
-            verdict = "Hold 不是方向性判断，不计入胜率"
-        elif call_alpha > 0:
-            verdict = "论文兑现"
-        else:
-            verdict = "论文没兑现"
-        print(f"📊 {e['id']}  {e['ticker']} {e['rating']}  {held}d")
-        print(f"   原始 {raw:+.1f}%   基准({e['benchmark']}) {bench:+.1f}%   **alpha {alpha:+.1f}%**"
-              + (f"   方向修正后 {call_alpha:+.1f}%" if direction == -1 else "")
-              + f"  → {verdict}")
-        if direction == 1 and raw > 0 and alpha < 0:
-            print(f"   ⚠️  赚了 {raw:+.1f}% 但跑输基准 {abs(alpha):.1f}%——这是论文错了，不是赚了。")
-        if direction == -1 and alpha > 0:
-            print(f"   ⚠️  当初的结论是「{e['rating']}」，标的却跑赢基准 {alpha:+.1f}%——判错了。")
+            stale = days_between(exit_date, today())
+            if stale > 10 and not args.early:
+                print(f"⚠️  {e['id']}：判定日用的是 {exit_date}，距今 {stale} 天——"
+                      f"数据可能停在停牌前。")
 
-    atomic_write(path, new_text)
-    print("\n下一步：给每条写 2-4 句反思 —— "
-          "`decision_log.py reflect --id <ID> --text \"...\"`。不写反思，下次研究就读不到教训。")
+            m = measure(e, dates, smap, bmap, exit_date)
+            meta = {k: e.get(k, "") for k in META_KEYS}
+            meta.update({
+                "status": "resolved", "resolved_on": m["exit_date"],
+                # 入场价也用判定时这一次拉取的序列重算——这是复权基准错配的修复点：
+                # 记录里存的那个是当初快照下的值，和今天的退出价基准不同。
+                "entry_date": m["entry_date"],
+                "entry_price": f"{m['entry_px']:.4f}", "bench_entry": f"{m['bench_entry']:.4f}",
+                "exit_price": f"{m['exit_px']:.4f}", "bench_exit": f"{m['bench_exit']:.4f}",
+                "raw_return": f"{m['raw']:.2f}", "bench_return": f"{m['bench']:.2f}",
+                "alpha": f"{m['alpha']:.2f}",
+                "call_alpha": f"{m['call_alpha']:.2f}" if m["call_alpha"] is not None else "n/a",
+                "held_days": str(m["held"]),
+            })
+            rebuilt = render_entry(meta, e["_thesis"], e["_kill"], e["_reflection"])
+            new_text = new_text.replace(e["_raw"], rebuilt, 1)
+            n += 1
+
+            ca = m["call_alpha"]
+            verdict = ("Hold 不是方向性判断，不计入胜率" if ca is None
+                       else "论文兑现" if ca > 0 else "论文没兑现")
+            print(f"📊 {e['id']}  {e['ticker']} {e['rating']}  "
+                  f"{m['entry_date']} → {m['exit_date']}（{m['held']}d）")
+            print(f"   原始 {m['raw']:+.1f}%   基准({e['benchmark']}) {m['bench']:+.1f}%   "
+                  f"**alpha {m['alpha']:+.1f}%**"
+                  + (f"   方向修正后 {ca:+.1f}%" if DIRECTION.get(e["rating"]) == -1 else "")
+                  + f"  → {verdict}")
+            d = DIRECTION.get(e["rating"], 0)
+            if d == 1 and m["raw"] > 0 and m["alpha"] < 0:
+                print(f"   ⚠️  赚了 {m['raw']:+.1f}% 但跑输基准 {abs(m['alpha']):.1f}%——"
+                      f"这是论文错了，不是赚了。")
+            if d == -1 and m["alpha"] > 0:
+                print(f"   ⚠️  当初的结论是「{e['rating']}」，标的却跑赢基准 "
+                      f"{m['alpha']:+.1f}%——判错了。")
+
+        if n:
+            safe_write(path, new_text, entries)
+            print("\n下一步：给每条写 2-4 句反思 —— "
+                  "`decision_log.py reflect --id <ID> --text \"...\"`。不写反思，下次研究就读不到教训。")
+
+
+def cmd_void(args):
+    """作废一条：退市、停牌、并购、或者当初就没取到价——留着记录，但不进记分板。"""
+    path = args.log
+    with log_lock(path):
+        text = ensure_header(read_log(path))
+        entries = parse_entries(text)
+        hit = next((e for e in entries if e["id"] == args.id), None)
+        if not hit:
+            sys.exit(f"找不到 id={args.id}")
+        if hit["status"] == "void":
+            sys.exit(f"{args.id} 已经是 void。")
+        meta = {k: hit.get(k, "") for k in META_KEYS}
+        meta["status"] = "void"
+        refl = (hit["_reflection"] + "\n\n" if hit["_reflection"] else "") + f"作废：{args.reason}"
+        rebuilt = render_entry(meta, hit["_thesis"], hit["_kill"], refl)
+        safe_write(path, text.replace(hit["_raw"], rebuilt, 1), entries)
+        print(f"✅ {args.id} 已作废：{args.reason}（记录保留，不进记分板）")
 
 
 def cmd_reflect(args):
+    check_prose("text", args.text)
+    with log_lock(args.log):
+        _reflect_locked(args)
+
+
+def _reflect_locked(args):
     path = args.log
     text = ensure_header(read_log(path))
     entries = parse_entries(text)
@@ -517,7 +742,7 @@ def cmd_reflect(args):
            and not existing.startswith("待回填")) else args.text
     meta = {k: hit.get(k, "") for k in META_KEYS}
     rebuilt = render_entry(meta, hit["_thesis"], hit["_kill"], new.strip())
-    atomic_write(path, text.replace(hit["_raw"], rebuilt))
+    safe_write(path, text.replace(hit["_raw"], rebuilt, 1), entries)
     print(f"✅ 反思已写入 {args.id}")
 
 
@@ -525,20 +750,15 @@ def interim(e):
     """未到判定日的临时 alpha。只作参照，**不写回日志、不进记分板**——
     提前落盘就等于允许自己挑一个好看的日子把 pending 结掉。
     但下一次研究要看到它：'上次我说回避，它至今跑赢基准 20%' 是最该被读到的一句话。
-    返回 (raw, bench, alpha, call_alpha or None, held_days) 或 None。"""
-    entry_px, bench_entry = num(e.get("entry_price")), num(e.get("bench_entry"))
-    if entry_px is None or bench_entry is None:
+
+    和 cmd_resolve 走同一条计算路径（aligned_series + measure），差别只在退出日：
+    这里取最后一个共同交易日，那里取约定到期日。复权基准对齐的修复因此只有一处。
+    """
+    dates, smap, bmap = aligned_series(e["ticker"], e["benchmark"], e["decided_on"])
+    exit_date = pick_date(dates)
+    if not exit_date:
         return None
-    last = latest_price(fetch_adjclose(e["ticker"], e["decided_on"]))
-    blast = latest_price(fetch_adjclose(e["benchmark"], e["decided_on"]))
-    if not last or not blast:
-        return None
-    raw = (last[1] / entry_px - 1) * 100
-    bench = (blast[1] / bench_entry - 1) * 100
-    alpha = raw - bench
-    d = DIRECTION.get(e["rating"], 0)
-    return (raw, bench, alpha, alpha * d if d else None,
-            days_between(e["decided_on"], last[0]))
+    return measure(e, dates, smap, bmap, exit_date)
 
 
 def cmd_peek(args):
@@ -556,16 +776,17 @@ def cmd_peek(args):
             print(f"⚠️  {e['id']} 取不到价格，跳过", file=sys.stderr)
     if not rows:
         return
-    rows.sort(key=lambda x: -(abs(x[1][3]) if x[1][3] is not None else 0))
+    rows.sort(key=lambda x: -(abs(x[1]["call_alpha"]) if x[1]["call_alpha"] is not None else 0))
     print("# 临时战况（未到判定日，不计入记分板）\n")
     print(f"{'ID':<22} {'标的':<8} {'期限':<6} {'评级':<12} {'原始':>8} {'基准':>8} "
           f"{'alpha':>9} {'天数':>6}  判断")
     print("-" * 102)
-    for e, (raw, bench, alpha, ca, held) in rows:
+    for e, m in rows:
+        ca = m["call_alpha"]
         mark = "—" if ca is None else ("暂时对" if ca > 0 else "暂时错")
         print(f"{e['id']:<22} {e['ticker']:<8} {HORIZON_LABEL[hclass(e)]:<6} {e['rating']:<12} "
-              f"{raw:>7.1f}% {bench:>7.1f}% {alpha:>8.1f}% {held:>5}d  {mark}")
-    wrong = [e for e, (_, _, _, ca, _) in rows if ca is not None and ca < 0]
+              f"{m['raw']:>7.1f}% {m['bench']:>7.1f}% {m['alpha']:>8.1f}% {m['held']:>5}d  {mark}")
+    wrong = [e for e, m in rows if m["call_alpha"] is not None and m["call_alpha"] < 0]
     if wrong:
         print(f"\n⚠️  {len(wrong)} 条目前站在错的一边："
               f"{', '.join(e['ticker'] for e in wrong)}。"
@@ -581,7 +802,7 @@ def cmd_due(args):
             continue
         held = days_between(e["decided_on"], today())
         horizon = int(num(e.get("horizon_days"), 0))
-        if held >= horizon:
+        if today() >= maturity_date(e):
             rows.append((e, held, horizon))
     if not rows:
         n = sum(1 for e in entries if e["status"] == "pending")
@@ -653,13 +874,14 @@ def cmd_context(args):
                          f"基准 {num(e['bench_return'], 0):+.1f}% / "
                          f"**alpha {num(e['alpha'], 0):+.1f}%**（{e['held_days']}d）{verdict}")
             else:
-                r = None if args.no_fetch else interim(e)
-                if r:
-                    raw, bench, alpha, ca, held = r
+                m = None if args.no_fetch else interim(e)
+                if m:
+                    ca = m["call_alpha"]
                     stand = "" if ca is None else ("　暂时站在对的一边" if ca > 0
                                                    else "　**暂时站在错的一边**")
-                    head += (f" → 尚未到判定日；至今原始 {raw:+.1f}% / "
-                             f"基准 {bench:+.1f}% / **alpha {alpha:+.1f}%**（{held}d）{stand}")
+                    head += (f" → 尚未到判定日（约定 {maturity_date(e)}）；至今原始 "
+                             f"{m['raw']:+.1f}% / 基准 {m['bench']:+.1f}% / "
+                             f"**alpha {m['alpha']:+.1f}%**（{m['held']}d）{stand}")
                 else:
                     head += "  → 尚未判定"
             print(f"- {head}")
@@ -781,7 +1003,14 @@ def main():
 
     r = sub.add_parser("resolve", help="回填 alpha（不给 --id 就回填所有到期条目）")
     r.add_argument("--id", default="")
+    r.add_argument("--early", action="store_true",
+                   help="未到判定日也强行结掉，并用最新价。会让分数取决于你哪天跑，慎用")
     r.set_defaults(func=cmd_resolve)
+
+    v = sub.add_parser("void", help="作废一条（退市/停牌/并购/当初没取到价）")
+    v.add_argument("--id", required=True)
+    v.add_argument("--reason", required=True)
+    v.set_defaults(func=cmd_void)
 
     f = sub.add_parser("reflect", help="写 2-4 句反思")
     f.add_argument("--id", required=True)
@@ -811,7 +1040,11 @@ def main():
     s.set_defaults(func=cmd_score)
 
     args = p.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except LogCorrupt as ex:
+        sys.exit(f"❌ 日志结构有问题，已中止（文件未被修改）：\n   {ex}\n"
+                 f"   日志：{args.log}")
 
 
 if __name__ == "__main__":
