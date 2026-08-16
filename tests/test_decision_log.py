@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
 
 import decision_log as D          # noqa: E402
 import tech_snapshot as T         # noqa: E402
+import options_snapshot as O      # noqa: E402
 
 
 def make_meta(**kw):
@@ -266,6 +267,56 @@ class Indicators(unittest.TestCase):
     def test_max_drawdown_sign(self):
         self.assertAlmostEqual(T.max_drawdown([100, 50]), -50.0, places=6)
         self.assertAlmostEqual(T.max_drawdown([100, 110]), 0.0, places=6)
+
+
+class Options(unittest.TestCase):
+    """期权链解析。行权价放大 1000 倍存在 OCC 代码里，解错一位就是 10 倍的价位。"""
+
+    def test_occ_symbol_parsed(self):
+        c = O.parse_contract({"option": "AAOI260911P00150000", "bid": 16.4, "ask": 19.3,
+                              "iv": 1.103, "delta": -0.4325, "open_interest": 5, "volume": 15})
+        self.assertEqual(c["type"], "P")
+        self.assertEqual(c["strike"], 150.0)
+        self.assertEqual(c["expiry"], "2026-09-11")
+        self.assertAlmostEqual(c["mid"], 17.85, places=6)
+
+    def test_fractional_strike(self):
+        c = O.parse_contract({"option": "AAOI260911C00152500", "bid": 1.0, "ask": 1.2})
+        self.assertEqual(c["strike"], 152.5)
+        self.assertEqual(c["type"], "C")
+
+    def test_numeric_root_ok(self):
+        # 有些标的代码带数字，正则不能因此拒绝
+        self.assertIsNotNone(O.parse_contract({"option": "BRKB260918C00500000",
+                                               "bid": 1.0, "ask": 1.1}))
+
+    def test_malformed_symbol_returns_none(self):
+        for bad in ("", "NOTANOPTION", "AAOI2609P00150000", "AAOI269911C00150000"):
+            self.assertIsNone(O.parse_contract({"option": bad}), bad)
+
+    def test_spread_pct(self):
+        c = O.parse_contract({"option": "AAOI260911C00150000", "bid": 9.0, "ask": 11.0})
+        self.assertAlmostEqual(c["mid"], 10.0, places=6)
+        self.assertAlmostEqual(c["spread_pct"], 20.0, places=6)   # (11−9)/10
+
+    def test_atm_iv_uses_nearest_strike_both_sides(self):
+        cs = [{"type": "C", "strike": 100.0, "iv": 0.40},
+              {"type": "C", "strike": 150.0, "iv": 0.60},
+              {"type": "P", "strike": 150.0, "iv": 0.80}]
+        self.assertAlmostEqual(O.atm_iv(cs, 149.0), 0.70, places=6)   # (0.60+0.80)/2
+
+    def test_expected_move_from_straddle(self):
+        cs = [{"type": "C", "strike": 100.0, "mid": 6.0},
+              {"type": "P", "strike": 100.0, "mid": 4.0}]
+        self.assertAlmostEqual(O.straddle_expected_move(cs, 100.0), 8.5, places=6)
+
+    def test_expected_move_needs_both_sides(self):
+        self.assertIsNone(O.straddle_expected_move([{"type": "C", "strike": 1.0, "mid": 1.0}], 1.0))
+
+    def test_tier_gate_shared_with_tech_snapshot(self):
+        # 期权工具复用同一个白名单，不能各判各的
+        self.assertEqual(O.tier_of("300285.SZ")[0], "T3")
+        self.assertEqual(O.tier_of("AAOI")[0], "T1")
 
 
 if __name__ == "__main__":
