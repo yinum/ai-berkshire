@@ -190,6 +190,42 @@ class Ratings(unittest.TestCase):
         self.assertEqual(D.num("1.5"), 1.5)
 
 
+class PackageCoherence(unittest.TestCase):
+    """整包一致性。第三轮评审的根因是「同一条规则有两份实现」——
+    这些用例锁住的是**跨组件**的约定，不是单个函数的行为。"""
+
+    def test_tier_rule_has_one_owner(self):
+        # decision_log 曾自带一份黑名单，与 tech_snapshot 的白名单漂移：
+        # 同一个 SHOP.TO，快照判 T3、日志判 T1（还配 SPY 基准）
+        for t in ("SHOP.TO", "6488.TWO", "SAP.DE", "^GSPC", "BTC-USD", "0700.HK", "AAOI"):
+            self.assertEqual(D.guess_tier(t), T.tier_of(t)[0], t)
+
+    def test_untradable_cannot_be_logged_as_buy(self):
+        self.assertEqual(D.DIRECTION["Buy"], 1)
+        self.assertEqual(D.DIRECTION["Overweight"], 1)
+        self.assertNotEqual(D.guess_tier("6488.TWO"), "T1")
+
+    def test_kind_separates_stock_and_options_entries(self):
+        # 一份双轨报告同日同源要能记「长线股票」「短线股票」「期权」三条
+        self.assertIn("options", D.KINDS)
+        self.assertIn("kind", D.META_KEYS)
+        self.assertEqual(D.kind_of({"kind": "options"}), "options")
+        self.assertEqual(D.kind_of({}), "stock")          # 老条目默认股票
+
+    def test_rating_constants_are_the_canonical_source(self):
+        # build.py 从这两个常量生成注入文本；名字或结构变了要让测试先失败
+        self.assertEqual(D.RATINGS, ["Buy", "Overweight", "Hold", "Underweight", "Sell"])
+        self.assertEqual(set(D.RATING_BEHAVIOR), set(D.RATINGS))
+
+    def test_maturity_drives_overdue_detection(self):
+        e = make_meta(decided_on="2026-01-01", horizon_days="30")
+        self.assertEqual(D.maturity_date(e), "2026-01-31")
+        self.assertGreater(D.today(), D.maturity_date(e))   # 该被 context 挡路
+
+    def test_void_is_a_real_status(self):
+        self.assertIn("void", D.STATUSES)
+
+
 class Tiers(unittest.TestCase):
     """白名单：未知后缀一律不可交易（两位评审都点名的最高频漏洞）。"""
 

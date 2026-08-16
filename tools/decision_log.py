@@ -48,6 +48,9 @@ import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
+sys.path.insert(0, __file__.rsplit("/", 1)[0])
+from tech_snapshot import tier_of            # noqa: E402  分层门禁的唯一权威
+
 # ============================================================
 # 常量
 # ============================================================
@@ -97,8 +100,10 @@ TIERS = ["T1", "T2", "T3"]
 STATUSES = ["pending", "resolved", "void"]
 
 # 元数据字段：可见的 markdown 键值行，工具与人读同一份文本，不存隐藏副本
+KINDS = {"stock": "股票", "options": "期权"}
+
 META_KEYS = [
-    "id", "ticker", "market", "tier", "rating", "decided_on",
+    "id", "ticker", "market", "tier", "kind", "rating", "decided_on",
     "horizon_class", "horizon_days",
     "benchmark", "entry_date", "entry_price", "bench_entry", "status", "source", "retro",
     "resolved_on", "exit_price", "bench_exit", "raw_return", "bench_return",
@@ -351,9 +356,15 @@ def hclass(meta):
     return v if v in HORIZON_CLASSES else "long"
 
 
+def kind_of(meta):
+    """老条目没有这个字段，一律按股票判断处理。"""
+    v = (meta.get("kind") or "").strip()
+    return v if v in KINDS else "stock"
+
+
 def render_entry(meta, thesis, kill, reflection):
     lines = [ENTRY_START, ""]
-    tag = (f"{meta['decided_on']} | {meta['ticker']} | "
+    tag = (f"{meta['decided_on']} | {meta['ticker']} | {KINDS[kind_of(meta)]} | "
            f"{HORIZON_LABEL[hclass(meta)]} | {meta['rating']} | ")
     tag += ({"pending": "pending", "void": "void（已作废，不计分）"}.get(meta["status"])
             or fmt_result_tag(meta))
@@ -489,13 +500,19 @@ def guess_market(ticker):
         return "jp"
     if t.endswith((".SS", ".SZ")):
         return "cn"
-    if t.endswith(".TW"):
+    if t.endswith((".TW", ".TWO")):
         return "tw"
     return "us"
 
 
-def guess_tier(market):
-    return {"us": "T1", "hk": "T2", "jp": "T2", "cn": "T3", "tw": "T3"}.get(market, "T1")
+def guess_tier(ticker):
+    """分层判定**只有一个权威副本**：`tech_snapshot.tier_of`。
+
+    这里原来自己维护了一份黑名单，而 tech_snapshot 在评审后已经改成白名单——
+    结果同一个 SHOP.TO / 6488.TWO / ^GSPC，快照判 T3、日志判 T1（还配 SPY 基准）。
+    同一条规则有两份实现，就一定会漂移；第三轮评审抓的正是这个。
+    """
+    return tier_of(ticker)[0]
 
 
 def next_id(entries, ticker, date_str, hc="long"):
@@ -556,19 +573,29 @@ def _add_locked(args, path):
         sys.exit(f"评级无法解析：'{args.rating}'。只收五档：{' / '.join(RATINGS)}（星级和中文也认，见 RATING_ALIASES）")
 
     hc = args.horizon_class
-    # 写入前扫一遍防重复。**horizon_class 必须进 key**——双轨研究下同一份报告
-    # 同一天本来就会产出一长一短两条判断，那不是重复。
+    kind = args.kind
+    # 写入前扫一遍防重复。**horizon_class 和 kind 都必须进 key**——
+    # 一份双轨报告同一天本来就会产出「长线股票」「短线股票」，加期权节还会有
+    # 「期权」，三条同源同日，那不是重复。第三轮评审前 kind 不在键里，
+    # 期权条目会被当成短线条目的重复而直接拒收——等于期权那一节根本记不进来。
     for e in entries:
         if (e["ticker"].upper() == ticker and e["decided_on"] == decided_on
                 and e.get("source", "") == (args.source or "—")
-                and hclass(e) == hc):
+                and hclass(e) == hc and kind_of(e) == kind):
             sys.exit(f"重复：{e['id']} 已经是同标的 + 同决策日 + 同来源报告 + 同"
-                     f"{HORIZON_LABEL[hc]}。要改评级请新开一条，不要覆盖。")
+                     f"{HORIZON_LABEL[hc]} + 同{KINDS[kind]}。要改评级请新开一条，不要覆盖。")
 
     market = args.market or guess_market(ticker)
-    tier = args.tier or guess_tier(market)
+    tier = args.tier or guess_tier(ticker)
     if tier not in TIERS:
         sys.exit(f"tier 只能是 {TIERS}")
+
+    # T2/T3 不许记方向性买入。CLAUDE.md 第二节的硬约束此前在日志这一层完全没有闸门——
+    # 一条 T3 的 Buy 记进去，下次 context 还会原样回放「上次判断 Buy」。
+    if tier != "T1" and DIRECTION.get(rating, 0) > 0 and not args.allow_untradable:
+        sys.exit(f"❌ {ticker} 是 {tier}，美国零售券商买不到，不许记 {rating}。\n"
+                 f"   想留个研究痕迹就用 --rating Hold（并在 thesis 开头写「不可交易」）；\n"
+                 f"   确实要记买入判断请显式加 --allow-untradable。")
     benchmark = args.benchmark or BENCHMARKS.get(market, "SPY")
 
     # 取入场价：按**共同交易日**取，窗口给到决策日 +14 天。
@@ -589,6 +616,7 @@ def _add_locked(args, path):
         "ticker": ticker,
         "market": market,
         "tier": tier,
+        "kind": kind,
         "rating": rating,
         "decided_on": decided_on,
         "horizon_class": hc,
@@ -604,7 +632,8 @@ def _add_locked(args, path):
     entry = render_entry(meta, args.thesis, args.kill, "")
     safe_write(path, text.rstrip() + "\n\n" + entry + "\n", entries, expect_delta=1)
 
-    print(f"✅ {meta['id']}  {ticker} {HORIZON_LABEL[hc]} {rating} [{tier}]  基准 {benchmark}")
+    print(f"✅ {meta['id']}  {ticker} {KINDS[kind]}·{HORIZON_LABEL[hc]} {rating} "
+          f"[{tier}]  基准 {benchmark}")
     if entry_date:
         print(f"   建仓参考 {entry_date} @ {smap[entry_date]:.2f}，基准 @ {bmap[entry_date]:.2f}")
     print(f"   判定日 ≥ {(datetime.strptime(decided_on, '%Y-%m-%d') + timedelta(days=horizon)).strftime('%Y-%m-%d')}"
@@ -857,6 +886,27 @@ def cmd_context(args):
               f"否则下一次研究还是从零开始。")
         return
 
+    # 逾期未回填的，必须顶到最前面并挡路。
+    # 闭环的后半段（due → resolve → reflect）此前没有任何指令会去触发：
+    # 注入的策略只说「研究前 context、出结论后 add」，于是回填永远不会发生，
+    # 「跨标的教训」那一节会永远打印「无」。整套系统最核心的那一环就此空转。
+    overdue = [e for e in entries
+               if e["status"] == "pending" and today() >= maturity_date(e)]
+    if overdue:
+        print("## ⛔ 先把到期的账结了，再开始研究\n")
+        print(f"有 **{len(overdue)} 条**记录已过约定判定日却还没回填。"
+              f"不回填就没有反思，没有反思下一次研究就读不到教训——"
+              f"这个日志存在的意义就落空了。\n")
+        for e in overdue:
+            print(f"- `{e['id']}` {e['ticker']} {e['rating']}"
+                  f"（约定 {maturity_date(e)}，已逾期 "
+                  f"{days_between(maturity_date(e), today())} 天）")
+        print("\n**先跑这两条，再继续：**\n")
+        print("```bash")
+        print("python3 tools/decision_log.py resolve")
+        print('python3 tools/decision_log.py reflect --id <ID> --text "2-4 句：当初错在哪"')
+        print("```\n")
+
     print("## 先读这段：我在这家公司 / 这套方法上过去错在哪\n")
     print("> 下面是决策日志的自动注入。**报告开头必须明确回应它**——"
           "上次的判断兑现了没有、这次哪里改了、为什么这次不会重犯。\n")
@@ -866,24 +916,37 @@ def cmd_context(args):
         if not same:
             print(f"无。这是第一次记录 {ticker}。\n")
         for e in same:
-            head = f"**{e['decided_on']} · {HORIZON_LABEL[hclass(e)]} · {e['rating']}**"
-            if e["status"] == "resolved":
+            # status / source / kind 必须打印出来：`options-view` 第零步的闸门
+            # 要靠它们判断（非 void、来源不是期权报告、方向一致）。
+            # 之前 context 一个都不输出，那道闸门等于写了个模型执行不了的检查。
+            head = (f"**{e['decided_on']} · {KINDS[kind_of(e)]} · {HORIZON_LABEL[hclass(e)]} · "
+                    f"{e['rating']}** `[{e['status']}·{e['tier']}]`"
+                    f"\n  - 来源：`{e.get('source', '—')}`")
+            if e["status"] == "void":
+                head += "\n  - ⚠️ **此条已作废，不能作为任何判断的依据**"
+            elif e["status"] == "resolved":
                 ca = num(e.get("call_alpha"))
                 verdict = "" if ca is None else ("　**判对了**" if ca > 0 else "　**判错了**")
                 head += (f" → 原始 {num(e['raw_return'], 0):+.1f}% / "
                          f"基准 {num(e['bench_return'], 0):+.1f}% / "
                          f"**alpha {num(e['alpha'], 0):+.1f}%**（{e['held_days']}d）{verdict}")
             else:
+                # 逾期和未到期是两回事。原来一律说「尚未到判定日」——
+                # 一条逾期 227 天的记录也这么显示，等于告诉模型判定日还没到。
+                due = maturity_date(e)
+                late = today() >= due
+                when = (f"**⛔ 已过判定日 {due}（逾期 {days_between(due, today())} 天），"
+                        f"先 resolve + reflect**" if late else f"尚未到判定日（约定 {due}）")
                 m = None if args.no_fetch else interim(e)
                 if m:
                     ca = m["call_alpha"]
                     stand = "" if ca is None else ("　暂时站在对的一边" if ca > 0
                                                    else "　**暂时站在错的一边**")
-                    head += (f" → 尚未到判定日（约定 {maturity_date(e)}）；至今原始 "
+                    head += (f" → {when}；至今原始 "
                              f"{m['raw']:+.1f}% / 基准 {m['bench']:+.1f}% / "
                              f"**alpha {m['alpha']:+.1f}%**（{m['held']}d）{stand}")
                 else:
-                    head += "  → 尚未判定"
+                    head += f" → {when}"
             print(f"- {head}")
             if e["_thesis"]:
                 print(f"  - 当初的论文：{e['_thesis']}")
@@ -993,6 +1056,10 @@ def main():
     a.add_argument("--tier", default="", choices=[""] + TIERS, help="可交易分层，默认按后缀猜")
     a.add_argument("--market", default="", help="us/hk/jp/cn/tw，默认按后缀猜")
     a.add_argument("--benchmark", default="", help="默认按市场选：" + str(BENCHMARKS))
+    a.add_argument("--kind", default="stock", choices=list(KINDS),
+                   help="stock = 对股票的判断；options = 期权结构表达的判断")
+    a.add_argument("--allow-untradable", action="store_true",
+                   help="显式允许给 T2/T3 记方向性买入（默认拒绝）")
     a.add_argument("--horizon-class", default="long", choices=list(HORIZON_CLASSES),
                    dest="horizon_class",
                    help="long = 值不值得长期持有（默认 180 天）；short = 这一两个月的择时（默认 30 天）")
