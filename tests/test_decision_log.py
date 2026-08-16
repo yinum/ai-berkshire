@@ -269,54 +269,141 @@ class Indicators(unittest.TestCase):
         self.assertAlmostEqual(T.max_drawdown([100, 110]), 0.0, places=6)
 
 
+def quote(sym, bid, ask, **kw):
+    d = {"option": sym, "bid": bid, "ask": ask}
+    d.update(kw)
+    return d
+
+
+def leg(cp, strike, mid=None, iv=None, two_sided=True):
+    return {"type": cp, "strike": strike, "mid": mid, "iv": iv, "two_sided": two_sided}
+
+
 class Options(unittest.TestCase):
-    """期权链解析。行权价放大 1000 倍存在 OCC 代码里，解错一位就是 10 倍的价位。"""
+    """期权链解析。行权价以千分之一美元存在 OCC 代码里，解错一位就是 10 倍的价位。"""
 
     def test_occ_symbol_parsed(self):
-        c = O.parse_contract({"option": "AAOI260911P00150000", "bid": 16.4, "ask": 19.3,
-                              "iv": 1.103, "delta": -0.4325, "open_interest": 5, "volume": 15})
+        c = O.parse_contract(quote("AAOI260911P00150000", 16.4, 19.3,
+                                   iv=1.103, delta=-0.4325, open_interest=5, volume=15))
         self.assertEqual(c["type"], "P")
         self.assertEqual(c["strike"], 150.0)
         self.assertEqual(c["expiry"], "2026-09-11")
         self.assertAlmostEqual(c["mid"], 17.85, places=6)
+        self.assertEqual(c["mid_source"], "quote")
 
     def test_fractional_strike(self):
-        c = O.parse_contract({"option": "AAOI260911C00152500", "bid": 1.0, "ask": 1.2})
+        c = O.parse_contract(quote("AAOI260911C00152500", 1.0, 1.2))
         self.assertEqual(c["strike"], 152.5)
-        self.assertEqual(c["type"], "C")
-
-    def test_numeric_root_ok(self):
-        # 有些标的代码带数字，正则不能因此拒绝
-        self.assertIsNotNone(O.parse_contract({"option": "BRKB260918C00500000",
-                                               "bid": 1.0, "ask": 1.1}))
 
     def test_malformed_symbol_returns_none(self):
         for bad in ("", "NOTANOPTION", "AAOI2609P00150000", "AAOI269911C00150000"):
-            self.assertIsNone(O.parse_contract({"option": bad}), bad)
+            self.assertIsNone(O.parse_contract(quote(bad, 1.0, 1.1)), bad)
 
-    def test_spread_pct(self):
-        c = O.parse_contract({"option": "AAOI260911C00150000", "bid": 9.0, "ask": 11.0})
-        self.assertAlmostEqual(c["mid"], 10.0, places=6)
-        self.assertAlmostEqual(c["spread_pct"], 20.0, places=6)   # (11−9)/10
+    def test_null_symbol_does_not_crash(self):
+        self.assertIsNone(O.parse_contract({"option": None, "bid": 1.0, "ask": 1.1}))
 
-    def test_atm_iv_uses_nearest_strike_both_sides(self):
-        cs = [{"type": "C", "strike": 100.0, "iv": 0.40},
-              {"type": "C", "strike": 150.0, "iv": 0.60},
-              {"type": "P", "strike": 150.0, "iv": 0.80}]
-        self.assertAlmostEqual(O.atm_iv(cs, 149.0), 0.70, places=6)   # (0.60+0.80)/2
 
-    def test_expected_move_from_straddle(self):
-        cs = [{"type": "C", "strike": 100.0, "mid": 6.0},
-              {"type": "P", "strike": 100.0, "mid": 4.0}]
-        self.assertAlmostEqual(O.straddle_expected_move(cs, 100.0), 8.5, places=6)
+class AdjustedContracts(unittest.TestCase):
+    """调整后/迷你合约交割物不是 100 股，必须整张丢掉而不是当标准合约混算。"""
+
+    def test_adjusted_root_rejected(self):
+        c = O.parse_contract(quote("AAOI1260911P00150000", 1.0, 1.2), expect_root="AAOI")
+        self.assertTrue(c.get("_nonstandard"))
+        self.assertEqual(c["root"], "AAOI1")
+
+    def test_mini_root_rejected(self):
+        c = O.parse_contract(quote("AAPL7260918C00200000", 1.0, 1.2), expect_root="AAPL")
+        self.assertTrue(c.get("_nonstandard"))
+
+    def test_standard_root_accepted(self):
+        c = O.parse_contract(quote("AAOI260911P00150000", 1.0, 1.2), expect_root="AAOI")
+        self.assertFalse(c.get("_nonstandard"))
+        self.assertEqual(c["strike"], 150.0)
+
+    def test_share_class_root_normalized(self):
+        # BRK-B 的合约根代码是 BRKB，不能被当成调整后合约丢掉
+        self.assertEqual(O.norm_root("BRK-B"), "BRKB")
+        c = O.parse_contract(quote("BRKB260918C00500000", 1.0, 1.1),
+                             expect_root=O.norm_root("BRK-B"))
+        self.assertFalse(c.get("_nonstandard"))
+
+
+class QuoteIntegrity(unittest.TestCase):
+    """交叉报价、单边报价、陈旧成交价——三条静默出错数字的路。"""
+
+    def test_normal_spread(self):
+        c = O.parse_contract(quote("AAOI260911C00150000", 9.0, 11.0))
+        self.assertAlmostEqual(c["spread_pct"], 20.0, places=6)
+        self.assertTrue(c["two_sided"])
+
+    def test_crossed_quote_is_not_liquid(self):
+        # 修复前：bid=11 ask=9 → 价差 −20% → 通过 <=15 判定，最坏的合约被标成最好的
+        c = O.parse_contract(quote("AAOI260911C00150000", 11.0, 9.0, open_interest=999))
+        self.assertFalse(c["two_sided"])
+        self.assertIsNone(c["spread_pct"])
+        self.assertFalse(O.is_liquid(c))
+
+    def test_zero_bid_falls_back_but_is_labelled(self):
+        c = O.parse_contract(quote("AAOI260911C00150000", 0, 1.2,
+                                   last_trade_price=0.9, open_interest=999))
+        self.assertFalse(c["two_sided"])
+        self.assertEqual(c["mid_source"], "last_trade")
+        self.assertEqual(c["mid"], 0.9)
+        self.assertFalse(O.is_liquid(c))      # 陈旧成交价不能算流动
+
+    def test_missing_iv_is_none_not_zero(self):
+        c = O.parse_contract(quote("AAOI260911C00150000", 1.0, 1.1))
+        self.assertIsNone(c["iv"])            # 渲染成 "—"，不是伪造的 0.0%
+
+    def test_liquidity_threshold_is_single_constant(self):
+        self.assertEqual(O.MAX_SPREAD_PCT, 10.0)
+        tight = O.parse_contract(quote("AAOI260911C00150000", 9.6, 10.4, open_interest=100))
+        wide = O.parse_contract(quote("AAOI260911C00150000", 9.0, 11.0, open_interest=100))
+        self.assertTrue(O.is_liquid(tight))   # 8%
+        self.assertFalse(O.is_liquid(wide))   # 20%，旧的 15% 阈值下会被算成流动
+        thin = O.parse_contract(quote("AAOI260911C00150000", 9.6, 10.4, open_interest=10))
+        self.assertFalse(O.is_liquid(thin))
+
+
+class OptionMath(unittest.TestCase):
+    def test_atm_uses_one_common_strike(self):
+        # call 和 put 最近行权价不同时，不能各取各的再平均——偏斜会让结果不是平值 IV
+        cs = [leg("C", 100.0, iv=0.40), leg("C", 150.0, iv=0.60), leg("P", 150.0, iv=0.80)]
+        self.assertEqual(O.common_atm_strike(cs, 149.0), 150.0)
+        self.assertAlmostEqual(O.atm_iv(cs, 149.0), 0.70, places=6)
+
+    def test_atm_needs_both_sides_at_that_strike(self):
+        cs = [leg("C", 150.0, iv=0.60)]        # 只有 call
+        self.assertIsNone(O.atm_iv(cs, 150.0))
+
+    def test_atm_ignores_one_sided_quotes(self):
+        cs = [leg("C", 150.0, iv=0.6, two_sided=False), leg("P", 150.0, iv=0.8)]
+        self.assertIsNone(O.common_atm_strike(cs, 150.0))
+
+    def test_far_strike_rejected(self):
+        # 跳空之后最近的共同行权价离现价太远，跨式里全是内在价值
+        cs = [leg("C", 100.0, mid=5.0, iv=0.5), leg("P", 100.0, mid=5.0, iv=0.5)]
+        self.assertIsNone(O.common_atm_strike(cs, 150.0))
+        self.assertIsNone(O.straddle_expected_move(cs, 150.0))
+
+    def test_expected_move_reports_median_and_one_sigma(self):
+        cs = [leg("C", 100.0, mid=6.0, iv=0.5), leg("P", 100.0, mid=4.0, iv=0.5)]
+        em = O.straddle_expected_move(cs, 100.0)
+        self.assertAlmostEqual(em["straddle"], 10.0, places=6)
+        self.assertAlmostEqual(em["median_move"], 8.5, places=6)    # ≈0.68σ，含概率约 50%
+        self.assertAlmostEqual(em["one_sigma"], 12.5, places=6)     # ≈1σ，含概率约 68%
+        self.assertGreater(em["one_sigma"], em["median_move"])      # 1σ 必须比中位波幅宽
 
     def test_expected_move_needs_both_sides(self):
-        self.assertIsNone(O.straddle_expected_move([{"type": "C", "strike": 1.0, "mid": 1.0}], 1.0))
+        self.assertIsNone(O.straddle_expected_move([leg("C", 100.0, mid=1.0, iv=0.5)], 100.0))
 
     def test_tier_gate_shared_with_tech_snapshot(self):
-        # 期权工具复用同一个白名单，不能各判各的
         self.assertEqual(O.tier_of("300285.SZ")[0], "T3")
         self.assertEqual(O.tier_of("AAOI")[0], "T1")
+
+    def test_expiry_uses_exchange_timezone(self):
+        # DTE 必须按美东日期算：用 UTC 的话美东晚 8 点后全部差一天
+        self.assertEqual(str(O.ET), "America/New_York")
 
 
 if __name__ == "__main__":
